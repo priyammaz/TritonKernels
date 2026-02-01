@@ -1,7 +1,7 @@
 """
 FlashAttention2 Kernel (Online-Softmax Applied to Attention)
 
-We will be implementing here the Forward pass of the Flash Attention kernel. 
+We will be implementing here the Forward/Backward pass of the Flash Attention kernel. 
 Once you understand this, you can go study the backward pass here!
 https://github.com/priyammaz/MyTorch/blob/main/mytorch/nn/functional/fused_ops/flash_attention.py
 
@@ -40,6 +40,8 @@ import torch
 import math
 import triton
 import triton.language as tl
+import warnings
+warnings.filterwarnings("ignore")
 
 def naive_attention(Q, K, V, is_causal=False):
     """
@@ -79,7 +81,7 @@ def naive_attention(Q, K, V, is_causal=False):
 
     return output 
 
-def flash_attention_forward(
+def flash_attention_forward_pseudocode(
     Q,  # (batch, num_heads, seq_len, head_dim)
     K,  # (batch, num_kv_heads, seq_len, head_dim)
     V,  # (batch, num_kv_heads, seq_len, head_dim)
@@ -115,21 +117,21 @@ def flash_attention_forward(
     ### Prescale our Queries ([Q @ K.T] * softmax_scale is the same as [(Q*softmax_scale) @ K.T])###
     Q = Q * softmax_scale
 
-    # ### Now remember, the softmax we are doing is applied to our attention  matrix ###
-    # ### which will be in the shape (batch, num_heads, seq_len, seq_len) and we do this ###
-    # ### softmax along the last dimension (so for every seq_len x seq_len matrix in this tensor ### 
-    # ### we do the softmax along the rows of this matrix) ###
-    # ### In our online softmax, we wanted to compute this as we go rather than all at once, and this was ##
-    # ### done by tracking some running statistics: 
-    # ###     M: the running max
-    # ###     L: the running exp sum
-    # ### We need to track this for every sample in the batch, for every head of attention, and for every row of the 
-    # ### final attention matrix! So lets initialize them  here!  
-    # ### As we compute them in the inner loop which you see later, we will store that information here
-    # M = torch.full((batch_size, num_heads, seq_len), float('-inf'), 
-    #                device=Q.device, dtype=torch.float32)  # running max
-    # L = torch.zeros((batch_size, num_heads, seq_len), 
-    #                 device=Q.device, dtype=torch.float32)  # running sum
+    ### Now remember, the softmax we are doing is applied to our attention  matrix ###
+    ### which will be in the shape (batch, num_heads, seq_len, seq_len) and we do this ###
+    ### softmax along the last dimension (so for every seq_len x seq_len matrix in this tensor ### 
+    ### we do the softmax along the rows of this matrix) ###
+    ### In our online softmax, we wanted to compute this as we go rather than all at once, and this was ##
+    ### done by tracking some running statistics: 
+    ###     M: the running max
+    ###     L: the running exp sum
+    ### We need to track this for every sample in the batch, for every head of attention, and for every row of the 
+    ### final attention matrix! So lets initialize them  here!  
+    ### As we compute them in the inner loop which you see later, we will store that information here
+    M = torch.full((batch_size, num_heads, seq_len), float('-inf'), 
+                   device=Q.device, dtype=torch.float32)  # running max
+    L = torch.zeros((batch_size, num_heads, seq_len), 
+                    device=Q.device, dtype=torch.float32)  # running sum
     
     ### Also our output of attention has the same shape tensor as the input. If the output of our softmax
     ### is (batch, num_heads, seq_len, seq_len) and we matmul this with our values tensor which has the 
@@ -467,6 +469,24 @@ def flash_attention_forward(
                         ### Update running max for the next iteration 
                         m_i = m_ij
 
+                ### After all Key/Values are processed, we have:
+                ### - m_i: the final max value for each query row
+                ### - l_i: the final sum of exp values for each query row
+                ### 
+                ### We need to convert this to the logsumexp format for storage
+                ### Logsumexp = m + log2(l)
+                ### 
+                ### This allows us to recover the exact softmax in the backward pass!
+                ### we will see the derivation for this later when we actually go to use it
+                ### But the made idea is we need our softmax output for the backward pass
+                ### but the softmax output is an N^2 tensor that we spent so much effort 
+                ### here to not compute. But the logsumexp trick gives us a quick way to 
+                ### recompute it by just storing this single value per row of softmax later!
+                m_i_logsumexp = m_i + torch.log2(l_i)
+
+                ### Store the output in M ###
+                M[b, h, q_start:q_end] = m_i_logsumexp
+
                 ### After all Key/Values are processed lets go ahead and normalize by the final sum ###
                 ### l_i is our per row accumulated sum that we have been 
                 O_block = O_block / (l_i[:, None] + 1e-6)
@@ -474,7 +494,348 @@ def flash_attention_forward(
                 ### Store the results ###
                 O[b, h, q_start:q_end, :] = O_block
         
-    return O
+    return O, M
+
+def flash_attention_backward_pseudocode(
+    Q,  # (batch, num_heads, seq_len, head_dim)
+    K,  # (batch, num_kv_heads, seq_len, head_dim)
+    V,  # (batch, num_kv_heads, seq_len, head_dim)
+    O,  # (batch, num_heads, seq_len, head_dim) - output from forward
+    dO, # (batch, num_heads, seq_len, head_dim) - gradient from upstream
+    M,  # (batch, num_heads, seq_len) - logsumexp from forward pass
+    softmax_scale=None,
+    is_causal=False,
+    BLOCK_SIZE_Q=64,
+    BLOCK_SIZE_KV=64
+):
+    """
+    Backward pass for Flash Attention
+    
+    Returns:
+        dQ: gradient w.r.t Q
+        dK: gradient w.r.t K  
+        dV: gradient w.r.t V
+    """
+
+    batch_size, num_heads, seq_len, head_dim = Q.shape
+
+    ### use default softmax scaling if not provided ###
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    ### Same adjustments as forward pass for exp2 vs exp ###
+    INV_LN2 = 1.442695040888963
+    LN2 = 0.693147182464 # 1 / INV_LN2 so we can unscale later
+
+    ### Adjust our softmax scale with this as we will be using it in a bit! 
+    softmax_scale *= INV_LN2
+
+    ### Prescale our Queries ###
+    Q = Q * softmax_scale
+
+    ### Initialize gradients ###
+    dQ = torch.zeros_like(Q)
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+
+    ########################################
+    ### STEP 1: PREPROCESS - Compute D ###
+    ########################################
+
+    ########################################
+    ### WHY D = sum(dO * O) APPEARS IN BACKWARD
+    ########################################
+
+    ### Forward (per row i):
+
+    ###     S_i = Q_i K^T / sqrt(d)
+    ###     P_i = softmax(S_i)
+    ###     O_i = P_i V = sum_j P_ij V_j
+
+    ### In the backward pass, we are given dO_i = ∂L / ∂O_i and want ∂L / ∂S_i.
+
+    ### From O_i = sum_j P_ij V_j,
+    ###     dP_ij = dO_i · V_j
+
+    ### For softmax, the gradient w.r.t. logits S is:
+    ###     dS_ij = P_ij ( dP_ij - sum_k P_ik dP_ik )
+
+    ### The second term couples all elements in the row and must be computed
+    ### for each row i.
+
+    ### Consider the row-wise sum:
+
+    ### sum_k P_ik dP_ik
+    ###     = sum_k P_ik (dO_i · V_k)
+    ###     = dO_i · (sum_k P_ik V_k)
+    ###     = dO_i · O_i
+
+    # This shows that the softmax normalization term depends only on
+    # the dot product between the output O_i and its gradient dO_i.
+
+    # D removes the component of the gradient that would uniformly shift
+    # all logits in a row. This enforces the softmax constraint and avoids
+    # explicitly forming the softmax Jacobian or storing dP.
+    D = torch.sum(dO * O, dim=-1) # (batch, num_heads, seq_len)
+
+    #########################################
+    ### STEP 2: COMPUTE dK and dV ###
+    #########################################
+    ### For dK and dV, we process blocks of K/V and loop through blocks of Q ###
+    ### This is because: ###
+    ###   dV = P^T @ dO  (where P is softmax output)
+    ###   dK = dS^T @ Q  (where dS is gradient of pre-softmax scores)
+    
+    ### Loop over Batch and Head 
+    for b in range(batch_size):
+        for h in range(num_heads):
+
+            ### Process K/V in Blocks (these are the "columns" we hold constant) ###
+            for kv_start in range(0, seq_len, BLOCK_SIZE_KV):
+
+                ### Make sure we only grab upto the valid K/V ###
+                kv_end = min(kv_start + BLOCK_SIZE_KV, seq_len)
+
+                ### Store indexes of K/V being processed
+                kv_indices = torch.arange(kv_start, kv_end, device=Q.device)
+                
+                ### Load block of keys and values ###
+                K_block = K[b, h, kv_start:kv_end, :]  # [block_kv, head_dim]
+                V_block = V[b, h, kv_start:kv_end, :]  # [block_kv, head_dim]
+
+                ### Initialize Accumulator for this Block ###
+                dK_block = torch.zeros((kv_end - kv_start, head_dim), device=Q.device, dtype=torch.float32)
+                dV_block = torch.zeros((kv_end - kv_start, head_dim), device=Q.device, dtype=torch.float32)
+
+                ### Determine which queries to process based on causality ###
+
+                ### [A11 A12 A13 A14 A15 A16]
+                ### [A21 A22 A23 A24 A25 A26]
+                ### [A31 A32 A33 A34 A35 A36]
+                ### [A41 A42 A43 A44 A45 A46]
+                ### [A51 A52 A53 A54 A55 A56]
+                ### [A61 A62 A63 A64 A65 A66]
+
+                ### For example If we are processing KV indexes 3,4 Then we have two choices
+                ### If causal, we are processing Q indexes 3,4,5,6 So we would be processing (+++)
+                ### [A11 A12 A13 A14 A15 A16]
+                ### [A21 A22 A23 A24 A25 A26]
+                ### [A31 A32 +++ +++ A35 A36]
+                ### [A41 A42 +++ +++ A45 A46]
+                ### [A51 A52 +++ +++ A55 A56]
+                ### [A61 A62 +++ +++ A65 A66]
+
+                ### Remember this is the full attention mask we want (without explicitly storing the whole thing)
+                ### [A11 xxx xxx xxx xxx xxx]
+                ### [A21 A22 xxx xxx xxx xxx]
+                ### [A31 A32 A33 xxx xxx xxx]
+                ### [A41 A42 A43 A44 xxx xxx]
+                ### [A51 A52 A53 A54 A55 xxx]
+                ### [A61 A62 A63 A64 A65 A66]
+
+                ### But in the small chunk of:
+                ### [A33 A34]
+                ### [A43 A44]
+
+                ### A34 is not a valid position (not causal), so this block
+                ### would have to be processed with a mask (diagonal block)
+
+                ### On the other hand the next chunk
+                ### [A53 A54]
+                ### [A63 A64]
+
+                ### All these positions are valid (postdiagonal)
+
+                if is_causal:
+                    ### For causal attention:
+                    ### 1. Process the diagonal block (where queries == keys in block range)
+                    ### 2. Process all blocks AFTER the diagonal (queries > keys)
+                    ###    because remember that causal means wherever our queries only
+                    ###    attend to keys that are at the same timestep or before
+                    
+                    ### Diagonal block: queries from kv_start to kv_end
+                    q_ranges_diagonal = [(kv_start, kv_end, "diagonal")]
+                    
+                    ### Post-diagonal blocks: queries from kv_end to seq_len
+                    q_ranges_post_diag = [(kv_end, seq_len, "postdiagonal")]
+                    
+                    q_ranges = q_ranges_diagonal + q_ranges_post_diag
+
+                ### IF we arent causal then just process everything (all queries!)
+                else:
+                    q_ranges = [(0, seq_len, "full")]
+                
+                ### Loop through the query ranges
+                for q_start_range, q_end_range, pass_type in q_ranges:
+
+                    ### Process queries in blocks within this range
+                    for q_start in range(q_start_range, q_end_range, BLOCK_SIZE_Q):
+
+                        ###  Make sure to only index upto the Q that we care about! 
+                        q_end = min(q_start + BLOCK_SIZE_Q, q_end_range)
+
+                        ### Store upto the Q indices we are processing right now 
+                        q_indices = torch.arange(q_start, q_end, device=Q.device)
+
+                        ### Load the Q Block and cooresponding gradients and stats
+                        Q_block = Q[b, h, q_start:q_end, :]      # [block_q, head_dim]
+                        dO_block = dO[b, h, q_start:q_end, :]    # [block_q, head_dim]
+                        M_block = M[b, h, q_start:q_end]         # [block_q]
+                        D_block = D[b, h, q_start:q_end]         # [block_q]
+
+                        ### Compute attention scores: Q @ K^T ###
+                        ### But we want the transpose for dK/dV computation ###
+                        ### So we compute K @ Q^T to get a transposed version ###
+                        S_T_block = K_block @ Q_block.T
+
+                        ### Recover softmax from logsumexp trick ###
+                        ### In forward pass we stored: M = max + log2(sum_exp) ###
+                        ### So: P = exp2(S - M) gives us softmax output ###
+                        ### But we have the transpose, so: ###
+                        P_T_block = torch.exp2(S_T_block - M_block[None, :])  # [block_kv, block_q]
+
+                        ### Apply causal masking on diagonal blocks ###
+                        if pass_type == "diagonal":
+                            ### For the diagonal block, we need to mask the upper triangle ###
+                            ### But since we have the transpose, we mask where kv > q ###
+                            ### Just so we have the indexes right! We could have just transposed after ###
+                            ### too this just saves a transpose op! ###
+                            causal_mask = kv_indices[:, None] <= q_indices[None, :]  # [block_kv, block_q]
+                            
+                            ### Mask fill the block ###
+                            P_T_block = P_T_block.masked_fill(~causal_mask, 0.0)
+
+                        ### Compute gradient for V ###
+                        ### dV = P^T @ dO ###
+                        ### We already have P^T, so: ###
+                        dV_block += P_T_block.to(Q_block.dtype) @ dO_block
+
+                        ### Compute gradient for K ###
+                        ### First compute dP (gradient w.r.t. softmax output) ###
+                        ### dP = dO @ V^T ###
+                        ### But we want dP^T, so: dP^T = V @ dO^T ###
+                        dP_T_block = V_block @ dO_block.T  # [block_kv, block_q]
+
+                        ### Compute dS (gradient w.r.t. pre-softmax scores) ###
+                        ### Formula: dS = P * (dP - D) ###
+                        ### In transpose: dS^T = P^T * (dP^T - D) ###
+                        ### Note: D is broadcast across the kv dimension ###
+                        dS_T_block = P_T_block * (dP_T_block - D_block[None, :])
+
+                        ### Account for the LN2 factor from exp2 vs exp ###
+                        ### Remember we want exp() but used exp2(), so to just
+                        ### adjust for the scale factor all our values are multiplied 
+                        ### by we want to undo it 
+                        dS_T_block = dS_T_block * LN2
+                        
+                        ### Now compute dK ###
+                        ### dK = dS^T @ Q ###
+                        ### We have dS^T already, so: ###
+                        dK_block += dS_T_block.to(Q_block.dtype) @ Q_block
+                
+                ### Store the gradients ###
+                dK[b, h, kv_start:kv_end, :] = dK_block
+                dV[b, h, kv_start:kv_end, :] = dV_block
+            
+    #########################################
+    ### STEP 3: COMPUTE dQ ###
+    #########################################
+    ### For dQ, we process blocks of Q and loop through blocks of K/V ###
+    ### This is because: ###
+    ###   dQ = dS @ K  (where dS is gradient of pre-softmax scores)
+    ### This is basically the same thing, just going the other direction!
+    
+    ### Loop over Batch and Head 
+    for b in range(batch_size):
+        for h in range(num_heads):
+            
+            ### Process Q in Blocks ###
+            for q_start in range(0, seq_len, BLOCK_SIZE_Q):
+                
+                ### Make sure we only grab up to the valid Q
+                q_end = min(q_start + BLOCK_SIZE_Q, seq_len)
+                
+                ### Store indexes of Q being processed
+                q_indices = torch.arange(q_start, q_end, device=Q.device)
+                
+                ### Load block of queries and corresponding data ###
+                Q_block = Q[b, h, q_start:q_end, :]      # [block_q, head_dim]
+                dO_block = dO[b, h, q_start:q_end, :]    # [block_q, head_dim]
+                M_block = M[b, h, q_start:q_end]         # [block_q]
+                D_block = D[b, h, q_start:q_end]         # [block_q]
+                
+                ### Initialize accumulator for this block ###
+                dQ_block = torch.zeros((q_end - q_start, head_dim), device=Q.device, dtype=torch.float32)
+                
+                ### Determine which keys/values to process based on causality ###
+                if is_causal:
+                    ### For causal attention:
+                    ### 1. Process all blocks BEFORE the diagonal (keys < queries)
+                    ### 2. Process the diagonal block (where queries == keys in block range)
+                    
+                    ### Pre-diagonal blocks: keys from 0 to q_start
+                    kv_ranges_pre_diag = [(0, q_start, "pre_diagonal")]
+                    
+                    ### Diagonal block: keys from q_start to q_end
+                    kv_ranges_diagonal = [(q_start, q_end, "diagonal")]
+                    
+                    kv_ranges = kv_ranges_pre_diag + kv_ranges_diagonal
+                else:
+                    ### For non-causal: process all keys/values
+                    kv_ranges = [(0, seq_len, "full")]
+                
+                ### Loop through key/value ranges ###
+                for kv_start_range, kv_end_range, pass_type in kv_ranges:
+                    
+                    ### Process keys/values in blocks within this range ###
+                    for kv_start in range(kv_start_range, kv_end_range, BLOCK_SIZE_KV):
+                        
+                        ### Make sure to only index up to the K/V that we care about!
+                        kv_end = min(kv_start + BLOCK_SIZE_KV, kv_end_range)
+                        
+                        ### Store the K/V indices we are processing right now
+                        kv_indices = torch.arange(kv_start, kv_end, device=Q.device)
+                        
+                        ### Load K and V blocks ###
+                        K_block = K[b, h, kv_start:kv_end, :]  # [block_kv, head_dim]
+                        V_block = V[b, h, kv_start:kv_end, :]  # [block_kv, head_dim]
+                        
+                        ### Compute attention scores: Q @ K^T ###
+                        S_block = Q_block @ K_block.T  # [block_q, block_kv]
+                        
+                        ### Recover softmax from logsumexp trick ###
+                        ### P = exp2(S - M) ###
+                        P_block = torch.exp2(S_block - M_block[:, None])  # [block_q, block_kv]
+                        
+                        ### Apply causal masking on diagonal blocks ###
+                        if pass_type == "diagonal":
+                            ### For the diagonal block, mask upper triangle ###
+                            ### (queries should not attend to future keys) ###
+                            causal_mask = q_indices[:, None] >= kv_indices[None, :]
+                            P_block = P_block.masked_fill(~causal_mask, 0.0)
+                        
+                        ### Compute dP (gradient w.r.t. softmax output) ###
+                        ### dP = dO @ V^T ###
+                        dP_block = dO_block @ V_block.T  # [block_q, block_kv]
+                        
+                        ### Compute dS (gradient w.r.t. pre-softmax scores) ###
+                        ### Formula: dS = P * (dP - D) ###
+                        dS_block = P_block * (dP_block - D_block[:, None])
+                        
+                        ### Account for the LN2 factor from exp2 vs exp ###
+                        dS_block = dS_block * LN2
+                        
+                        ### Compute dQ ###
+                        ### dQ = dS @ K ###
+                        dQ_block += dS_block.to(Q_block.dtype) @ K_block
+                
+                ### Apply the softmax scale to dQ (same scaling as forward) ###
+                dQ_block = dQ_block * softmax_scale
+                
+                ### Store the gradients ###
+                dQ[b, h, q_start:q_end, :] = dQ_block
+    
+    return dQ, dK, dV
 
 @triton.jit
 def _attn_fwd_inner(
@@ -632,7 +993,6 @@ def _attn_fwd_inner(
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_KV))
         
     return O_block, l_i, m_i
-
 
 @triton.autotune(
     configs=[
@@ -924,6 +1284,524 @@ def _attn_fwd(
     ### Store Q (again with a boundary check) ###
     tl.store(O_block_ptr, O_block.to(O.type.element_ty), boundary_check=(0,))
 
+@triton.autotune(
+    configs=[
+            triton.Config(
+                {"BLOCK_SIZE": BLOCK_SIZE},
+                num_stages=num_stages,
+                num_warps=num_warps,
+            )
+            for BLOCK_SIZE in [16, 32, 64, 128]
+            for num_stages in [2, 3, 4]
+            for num_warps in [4, 8, 16]
+        ],
+    key=["HEAD_DIM"],
+)
+@triton.jit
+def attn_backward_preprocess(
+    O_ptr, 
+    dO_ptr,
+    D_ptr,
+    stride_O_heads, 
+    stride_O_len, 
+    stride_O_embed,
+    stride_dO_heads, 
+    stride_dO_len, 
+    stride_dO_embed,
+    stride_D_head,
+    SEQ_LEN,
+    EMBED_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):  
+    
+    """
+    Just a fancy way to do sum(dO * O, axis=-1)
+    """
+    
+    row = tl.program_id(0)
+    index_batch_head = tl.program_id(1)
+
+    ### Our intermediate D is always float32 ###
+    D_ptr = tl.cast(D_ptr, tl.pointer_type(tl.float32))
+
+    ### Mask to not grab invalid rows along our sequence length ###
+    row_offsets = row * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    col_offsets = tl.arange(0, EMBED_DIM)
+    mask = row_offsets < SEQ_LEN
+
+    ### Grab our Output values ###
+    O_ptr += index_batch_head * stride_O_heads
+    O_offsets = row_offsets[:, None] * stride_O_len + col_offsets[None, :] * stride_O_embed
+    O = tl.load(O_ptr + O_offsets, mask = mask[:, None], other=0.)
+    
+    ### Grab our output grads ###
+    dO_ptr += index_batch_head * stride_dO_heads
+    dO_offsets = row_offsets[:, None] * stride_dO_len + col_offsets[None, :] * stride_dO_embed
+    dO = tl.load(dO_ptr + dO_offsets, mask = mask[:, None], other=0.)
+
+    ### Multiply and store them ###
+    Delta = tl.sum(dO.to(tl.float32) * O.to(tl.float32), axis=1) 
+    D_ptr += index_batch_head * stride_D_head
+    tl.store(D_ptr + row_offsets, Delta, mask = mask)
+
+@triton.jit
+def _attn_bwd_dk_dv(
+    K, 
+    V, 
+    dK, 
+    dV, 
+    Q_ptr, 
+    dO_ptr, 
+    M_ptr, 
+    D_ptr, 
+    stride_len, 
+    stride_embed, 
+    SEQ_LEN, 
+    HEAD_DIM: tl.constexpr, 
+    BLOCK_SIZE_ROW: tl.constexpr, 
+    BLOCK_SIZE_COL: tl.constexpr,
+    start_row, 
+    start_col, 
+    num_steps, 
+    ln2, 
+    MASK: tl.constexpr,
+    DTYPE_FLAG: tl.constexpr, # 0 for float32, 1 for float16
+):
+    """
+    Main method to compute the grads for dK,dV in blocks. This basically
+    assumes for some K,V we loop through blocks of queries
+    """
+    ### Fet Offset for starting row/col ###
+    offsets_row = start_row  + tl.arange(0, BLOCK_SIZE_ROW)
+    offsets_col = start_col + tl.arange(0, BLOCK_SIZE_COL)
+    offsets_embed = tl.arange(0, HEAD_DIM)
+
+    ### Load Transposed Q because we are computing the transpose of our softmax outputs ###
+    Q_T_offsets = offsets_embed[:, None] * stride_embed + offsets_row[None, :] * stride_len
+    dO_offsets = offsets_row[:, None] * stride_len + offsets_embed[None, :] * stride_embed
+
+    for _ in range(num_steps):
+        
+        ### Dont grab invalid queries ###
+        mask_Q = offsets_row < SEQ_LEN
+
+        ### Load our transpose queries ###
+        Q_T_block = tl.load(Q_ptr + Q_T_offsets, mask=mask_Q[None, :], other=0.)
+
+        ### Load the corresponding logsumexps, grads and Ds ###
+        M_block = tl.load(M_ptr + offsets_row, mask=mask_Q, other=0.)
+        dO_block = tl.load(dO_ptr + dO_offsets, mask=mask_Q[:, None], other=0.)
+        D_block = tl.load(D_ptr + offsets_row, mask=mask_Q, other=0.)
+
+        ### We can compute our block of the attention matrix now ###
+        S_T_block = tl.dot(K, Q_T_block) #(Macro x E) @ (E x Micro) -> Macro x Micro block
+
+        ### Now lets do softmax without actually doing softmax ! ###
+        ### This is one of the most important parts of the implementation! 
+        ### What we want is the softmaxed output in this block. But that would
+        ### require us to store the entire N x N matrix in memory. So can we instead
+        ### Compute it on the fly? In the forward pass we did online softmax, but we 
+        ### can avoid that too
+
+        ### remember we have stored m, our absolute max + log(denominator) 
+        ### for every row of our softmax These were computed in the forward 
+        ### pass so we can avoid doing it again. 
+
+        ### Recall softmax: P_ij = exp(S_ij) / sum(exp(S_i))
+        ### but we want stable softmax so instead we do
+        ### softmax: P_ij = exp(S_ij - max(S_i)) / sum_j(exp(S_ij - max(S_i))
+        ### and we already have m as our max so we can say:
+        ### softmax: P_ij = exp(S_ij - m_i) / sum_j(exp(S_ij - m_i))
+
+        ### So, what happens if we do this:
+
+        ### exp(QK^T - m) = exp(QK^T - max - log(denominator))
+        ### = exp(QK^T - max) / exp(log(denominator))
+        ### Isnt that just our softmax? yes! So we can get our softmax back really
+        ### easily with this trick!!!
+        P_T_block = tl.math.exp2(S_T_block - M_block[None, :])
+
+        if MASK:
+            ### Our P is transposed here. If causal, in the forward pass ###
+            ### only the lower triangle matters. This means in the backward ###
+            ### pass only the lower triangle matters, but because its transposed ###
+            ### we want the upper triangle instead! ###
+            mask_block = (offsets_col[:, None] <= offsets_row[None, :])
+
+            ### Set our invalid positions to 0 ###
+            P_T_block = tl.where(mask_block, P_T_block, 0.)
+
+        ### Now we start to accumulate grads. Each block of the output contribute to our 
+        ### gradient for dV. dV is P^T @ dO
+        ### But we are not processing all of our sequence length at once, only chunks of it
+        ### and our dV is dependent on contributions from the entire length so we can 
+        ### just accumulate as we go for the correct positions we are processing
+        dV = tl.dot(P_T_block.to(tl.float32 if DTYPE_FLAG == 0 else tl.float16), dO_block, acc=dV)
+
+        ### dP = dO @ V^T, but we want dP^T so we transpose the right side and get [dO @ V^T]^T = V @ dO^T
+        dP_T_block = tl.dot(V, tl.trans(dO_block))        
+
+        ### Then our dS = P*(dP - D) but we again have all transposes so we just use our transpoed P and dP
+        ### D is just a row vector that is the broadcasted over, so we add an extra dimension to make it (1 x Micro)
+        dS_T_block = P_T_block * (dP_T_block - D_block[None, :]) * ln2
+        dK = tl.dot(dS_T_block.to(tl.float32 if DTYPE_FLAG == 0 else tl.float16), tl.trans(Q_T_block), acc=dK)
+
+        ### Advance to the next query block 
+        offsets_row += BLOCK_SIZE_ROW  
+        Q_ptr += BLOCK_SIZE_ROW * stride_len
+        dO_ptr += BLOCK_SIZE_ROW * stride_len
+
+    return dK, dV
+
+@triton.jit
+def _attn_bwd_dq(
+    dQ, 
+    Q, 
+    dO, 
+    M, 
+    K_ptr, 
+    V_ptr, 
+    D_ptr, 
+    stride_len, 
+    stride_embed, 
+    SEQ_LEN, 
+    HEAD_DIM: tl.constexpr, 
+    BLOCK_SIZE_ROW: tl.constexpr,
+    BLOCK_SIZE_COL: tl.constexpr, 
+    start_row, 
+    start_col, 
+    num_steps, 
+    ln2: tl.constexpr, 
+    MASK: tl.constexpr,
+    DTYPE_FLAG: tl.constexpr, # 0 for float32, 1 for float16
+):
+    """
+    Nearly identical for _attn_bwd_dk_dv but now we have a block of Q and are 
+    looping through blocks of K,V to compute out dQ. And instead of computing 
+    some transpose of our blocks of the attention matrix, we compute the normal
+    non-transposed version as thats all we need
+    """
+    offsets_row = start_row + tl.arange(0, BLOCK_SIZE_ROW)
+    offsets_col = start_col + tl.arange(0, BLOCK_SIZE_COL)
+    offsets_embed = tl.arange(0, HEAD_DIM)
+
+    K_V_T_offsets = offsets_embed[:, None] * stride_embed + offsets_col[None, :] * stride_len
+    D_block = tl.load(D_ptr + offsets_row, mask=offsets_row<SEQ_LEN, other=0.)
+
+    for _ in range(num_steps):
+        
+        ### Dont grab invalid masks ###
+        mask_kv = offsets_col < SEQ_LEN
+
+        K_T_block = tl.load(K_ptr + K_V_T_offsets, mask=mask_kv[None, :], other=0.)
+        V_T_block = tl.load(V_ptr + K_V_T_offsets, mask=mask_kv[None, :], other=0.)
+
+        ### Compute our standard QK^T
+        S = tl.dot(Q, K_T_block)
+
+        ### Logsumexp trick to get our softmax values back 
+        P = tl.exp2(S - M)
+        
+        ### Mask for causality 
+        if MASK:
+            mask = offsets_row[:, None] >= offsets_col[None, :]
+            P = tl.where(mask, P, 0.)
+
+        ### Same formulation just for dQ now ###
+        dP = tl.dot(dO, V_T_block)
+        dS = P * (dP - D_block[:, None]) * ln2
+        dQ = tl.dot(dS.to(tl.float32 if DTYPE_FLAG == 0 else tl.float16), tl.trans(K_T_block), acc=dQ)
+
+        ### Advance to the next block of Keys/Values ###
+        offsets_col += BLOCK_SIZE_COL
+        K_ptr += BLOCK_SIZE_COL * stride_len
+        V_ptr += BLOCK_SIZE_COL * stride_len
+    
+    return dQ
+
+@triton.autotune(
+    configs=[
+            triton.Config(
+                {"BLOCK_SIZE_MACRO": BLOCK_SIZE_MACRO, "BLOCK_SIZE_MICRO": BLOCK_SIZE_MICRO},
+                num_stages=num_stages,
+                num_warps=num_warps,
+            )
+            for BLOCK_SIZE_MACRO in [16, 32, 64, 128]
+            for BLOCK_SIZE_MICRO in [16, 32, 64]
+            for num_stages in [2, 3, 4]
+            for num_warps in [4, 8, 16]
+            if BLOCK_SIZE_MICRO < BLOCK_SIZE_MACRO
+        ],
+    key=["HEAD_DIM"],
+)
+@triton.jit
+def _attn_bwd(
+    Q_ptr, 
+    K_ptr, 
+    V_ptr, 
+    dO_ptr, 
+    dQ_ptr, 
+    dK_ptr, 
+    dV_ptr, 
+    M_ptr, 
+    D_ptr, 
+    softmax_scale, 
+    stride_batch, 
+    stride_head, 
+    stride_len, 
+    stride_embed, 
+    stride_k_batch,
+    stride_k_head,
+    stride_k_len,
+    stride_k_embed,
+    NUM_HEADS, 
+    SEQ_LEN, 
+    HEAD_DIM: tl.constexpr, 
+    BLOCK_SIZE_MICRO: tl.constexpr,
+    BLOCK_SIZE_MACRO: tl.constexpr,
+    CAUSAL: tl.constexpr, # 1 for causal, 0 for noncausal 
+    DTYPE_FLAG: tl.constexpr, # 0 for float32 1 for float16,
+):
+    
+    tl.static_assert(BLOCK_SIZE_MACRO % BLOCK_SIZE_MICRO == 0)
+
+    ### Store our Contants for scaling due to exp2 vs exp difference ###
+    ln2: tl.constexpr = 0.693147182464
+    rln2: tl.constexpr = 1.442695040888
+
+    ### What Block are we processing? ###
+    pid = tl.program_id(0)
+
+    ### What Batch/Head are we on? ###
+    index_batch_head = tl.program_id(1)
+    offsets_embed = tl.arange(0, HEAD_DIM)
+    idx_batch = index_batch_head // NUM_HEADS
+    idx_head = index_batch_head % NUM_HEADS
+
+    ### Offset everything to our current Batch x Head ##
+    offset_batch_head_4d = idx_batch * stride_batch + idx_head * stride_head # for (B x H x L x E) Tensors
+    offset_batch_head_4d_kv = idx_batch * stride_k_batch + idx_head * stride_k_head
+    offset_batch_head_3d = index_batch_head * SEQ_LEN                        # for (B x H x L) Tensors
+
+    Q_ptr += offset_batch_head_4d
+    K_ptr += offset_batch_head_4d_kv
+    V_ptr += offset_batch_head_4d_kv
+    dO_ptr += offset_batch_head_4d
+    dQ_ptr += offset_batch_head_4d
+    dK_ptr += offset_batch_head_4d_kv
+    dV_ptr += offset_batch_head_4d_kv
+    M_ptr += offset_batch_head_3d
+    D_ptr += offset_batch_head_3d
+
+    ###################### dK dV #####################
+
+    ### Rows are the number of queries in every block we loop over 
+    ### Cols are the number of Keys/Values in our block that we hold constant in this specific thread
+    BLOCK_SIZE_ROW_1: tl.constexpr = BLOCK_SIZE_MICRO
+    BLOCK_SIZE_COL_1: tl.constexpr = BLOCK_SIZE_MACRO
+
+    ### STAGE 1: Process the Diagonal Block ###
+    ### Just like in the forward pass our diagonal block has a ###
+    ### Transition from causal to non-causal positions. ###
+    ### Lets process that first!
+    if CAUSAL == 1:
+
+        ### Index of the starting column (starting key/value index)
+        start_col = pid * BLOCK_SIZE_COL_1
+
+        ### The diagonal starts where our starting query index matches the starting key/value
+        start_row = start_col
+
+        ### Incase our blocks are not sqaure, it can take multiple micro iterations of our queries
+        ### to cover everything. For example, if a block of keys/values contain 64 timesteps, but
+        ### each block of queries we loop over has only 16 timesteps, it will take 4 steps to 
+        ### get through the full 64 x 64 block
+        num_steps = BLOCK_SIZE_COL_1 // BLOCK_SIZE_ROW_1
+    
+    ### If we are not causal then there isnt really anything to do, 
+    ### we loop over all possible Queries for this specific block of Keys/Values
+    else:
+
+        ### go from start to end for queries ###
+        start_row = 0
+
+        ### Processing this specific block of keys/values ###
+        start_col = pid * BLOCK_SIZE_COL_1
+
+        ### Just go however many blocks worth of queries it takes to cover the 
+        ### entire sequence length 
+        num_steps = tl.cdiv(SEQ_LEN, BLOCK_SIZE_ROW_1)
+
+    ### Load K/V ###
+    ### Instead of QK^T we will do KQ^T, giving us a transposed ###
+    ### output. This is because our dV is P^T @ dO, so might as well ###
+    ### just transpose it now rather than grab it normally and transpose after ###
+    offsets_col_1 = start_col + tl.arange(0, BLOCK_SIZE_COL_1)
+
+    ### Ensure we dont grab any invalid KV positions ###
+    KV_offsets = offsets_col_1[:, None] * stride_k_len + offsets_embed[None, :] * stride_k_embed
+    KV_mask = (offsets_col_1 < SEQ_LEN)
+
+    ### Load our data ! ###
+    K = tl.load(K_ptr + KV_offsets, mask=KV_mask[:, None], other=0.)
+    V = tl.load(V_ptr + KV_offsets, mask=KV_mask[:, None], other=0.)
+    
+    ### Prescale our inputs like we did in our forward pass ###
+    K *= softmax_scale * rln2
+    K = K.to(tl.float32 if DTYPE_FLAG == 0 else tl.float16)
+
+    ### Create empty tensors (in higher precision) to store our grads in ###
+    dK_block = tl.zeros([BLOCK_SIZE_COL_1, HEAD_DIM], dtype=tl.float32)
+    dV_block = tl.zeros([BLOCK_SIZE_COL_1, HEAD_DIM], dtype=tl.float32)
+
+    ### Run our backward pass for that block on the diagonal (if we are in causal mode) 
+    ### or for everything (if we are in non causal) ###
+    ### If we are in causal model then we will Mask as a part of that diagonal is invalid 
+    dK_block, dV_block = _attn_bwd_dk_dv(
+        K, V, dK_block, dV_block, 
+        Q_ptr, dO_ptr, M_ptr, D_ptr, 
+        stride_len, stride_embed, 
+        SEQ_LEN, HEAD_DIM, 
+        BLOCK_SIZE_ROW_1, BLOCK_SIZE_COL_1,
+        start_row, start_col, num_steps, 
+        ln2, 
+        MASK=(CAUSAL==1),
+        DTYPE_FLAG=DTYPE_FLAG,
+    )
+
+    ### STAGE 2: Process Under the Diagonal Block for Causal###
+    ### If we are in causal mode we need to do all the other off diagonal positions. ###
+    ### Now lets say we had the following block setup. Remember, each block has more ###
+    ### values inside it but we are processing at the block level
+
+    ### [B_00, B_01, B_02, B_03]
+    ### [B_10, B_11, B_12, B_13]
+    ### [B_20, B_21, B_22, B_23]
+    ### [B_30, B_31, B_32, B_33]
+
+    ### and lets say we processed B_11 just now (a diagonal block with transition from causal to non causal positions) 
+    ### Each thread here processes a column, as we picked a specific Key/Value, and we can loop through our queries. 
+    ### This means if we are causal, we need to also process B_21, and B_31! So lets move our starting row forward 
+    ### however many values there were in our keys/values and keep iterating downwards. 
+    if CAUSAL == 1:
+        
+        ### Push our starting point for the queries forward 1 blocks worth of Keys/Values 
+        start_row += BLOCK_SIZE_COL_1
+
+        ### keys/values block size worth of blocks do I need to cover the entire sequence?
+        ### And then multiply by by the blocks size to get the total number of timesteps. 
+        ### this may spill over the edge but thats ok we handle it with masking later!
+        N_adj = tl.cdiv(SEQ_LEN, BLOCK_SIZE_COL_1) * BLOCK_SIZE_COL_1
+
+        ### Take the total number of steps we need to cover the entire sequence, subtract out
+        ### the number of steps we have already taken, and then get how many blocks of size queries we 
+        ### need to cover that distance! 
+        num_steps = (N_adj - start_row) // BLOCK_SIZE_ROW_1
+
+        ### Backward pass again on these blocks underneath that diagonal block for the Causal Case 
+        dK_block, dV_block = _attn_bwd_dk_dv(
+            K, V, dK_block, dV_block, 
+            Q_ptr, dO_ptr, M_ptr, D_ptr, 
+            stride_len, stride_embed, 
+            SEQ_LEN, HEAD_DIM, 
+            BLOCK_SIZE_ROW_1, BLOCK_SIZE_COL_1,
+            start_row, start_col, num_steps, 
+            ln2, 
+            MASK=False,
+            DTYPE_FLAG=DTYPE_FLAG,
+        )
+
+    ### We didnt apply this scaling in our loop (as its just a constant) ###
+    ### but if we had some scaling on our input, then the backprop will also have ###
+    ### exactly the same scale (y = aX => dy/dx = a) 
+    dK_block *= softmax_scale * rln2
+
+    ### If we are not doing GQA we can just go ahead and store our ###
+    ### results for this specific batch/head ###
+    tl.store(dK_ptr + KV_offsets, dK_block, mask=KV_mask[:, None])
+    tl.store(dV_ptr + KV_offsets, dV_block, mask=KV_mask[:, None])
+
+
+    ###################### dQ ##################### 
+
+    ### Now we are grabbing some Q and looping over K,Vs. So we will 
+    ### have Macro blocks of Q and loop through micro blocks of KVs
+    BLOCK_SIZE_ROW_2: tl.constexpr = BLOCK_SIZE_MACRO
+    BLOCK_SIZE_COL_2: tl.constexpr = BLOCK_SIZE_MICRO
+
+    ### STAGE 1: Process the Diagonal Block ###
+    ### Same setup as before, just now we go the other direction ###
+    ### our pid sets which block of rows of queries we grab ###
+    ### and our diagnal K/V will have the same starting point along the cols 
+    if CAUSAL == 1:
+        start_row = pid * BLOCK_SIZE_ROW_2
+        start_col = start_row
+        num_steps = BLOCK_SIZE_ROW_2 // BLOCK_SIZE_COL_2
+    
+    ### In non causal we just process everything ###
+    else:
+        start_col = 0
+        start_row = pid * BLOCK_SIZE_ROW_2
+        num_steps = tl.cdiv(SEQ_LEN, BLOCK_SIZE_COL_2)
+
+    ### Compute offsets to grab our queries (also applies to our outputs) ###
+    offsets_row = start_row + tl.arange(0, BLOCK_SIZE_ROW_2)
+    Q_offsets = offsets_row[:, None] * stride_len + offsets_embed[None, :] * stride_embed
+
+    ### Mask out any invalid queries we grabbed ###
+    mask_row = offsets_row < SEQ_LEN
+
+    ### Load our Queries ###
+    Q_block = tl.load(Q_ptr + Q_offsets, mask=mask_row[:, None], other=0.)
+    
+    ### Prescale our Queries ###
+    Q_block *= softmax_scale * rln2
+    Q_block = Q_block.to(tl.float32 if DTYPE_FLAG == 0 else tl.float16)
+
+    ### Load our gradients for this specific block ###
+    dO_block = tl.load(dO_ptr + Q_offsets, mask=mask_row[:, None], other=0.)
+
+    ### These were the logsumexp values along the rows of queries we had in our attention matrix ###
+    ### this means we can just grab the corresponding block right here and pass it in rather than ###
+    ### grabing them a block at a time like we did earlier in our dKdV computation ###
+    M_block = tl.load(M_ptr + offsets_row, mask=mask_row, other=0.)[:, None]
+
+    ### Create a tensor for grad storage ###
+    dQ_block = tl.zeros([BLOCK_SIZE_ROW_2, HEAD_DIM], dtype=tl.float32)
+
+    ### First pass ###
+    dQ_block = _attn_bwd_dq(
+        dQ_block, Q_block, dO_block, M_block, 
+        K_ptr, V_ptr, D_ptr,
+        stride_k_len, stride_k_embed,
+        SEQ_LEN, HEAD_DIM, 
+        BLOCK_SIZE_ROW_2, BLOCK_SIZE_COL_2, 
+        start_row, start_col, num_steps, 
+        ln2, MASK=(CAUSAL==1),
+        DTYPE_FLAG=DTYPE_FLAG
+    )
+
+    ### Second pass (only for causal models) ###
+    if CAUSAL == 1:
+        end_col = start_col
+        start_col = 0
+        num_steps = end_col // BLOCK_SIZE_COL_2
+        dQ_block = _attn_bwd_dq(
+            dQ_block, Q_block, dO_block, M_block, 
+            K_ptr, V_ptr, D_ptr,
+            stride_k_len, stride_k_embed,
+            SEQ_LEN, HEAD_DIM, 
+            BLOCK_SIZE_ROW_2, BLOCK_SIZE_COL_2, 
+            start_row, start_col, num_steps, 
+            ln2, MASK=False,
+            DTYPE_FLAG=DTYPE_FLAG
+        )
+
+    ### Scale our grads with the same factor ###
+    dQ_block *= softmax_scale * rln2
+
+    tl.store(dQ_ptr + Q_offsets, dQ_block, mask=mask_row[:, None])
+
 def fused_sdpa_forward(Q, K, V, 
                        causal=False, 
                        softmax_scale=None):
@@ -974,12 +1852,85 @@ def fused_sdpa_forward(Q, K, V,
         DTYPE_FLAG=0 if Q.dtype == torch.float32 else 1,
     )
 
-    return O
+    return O, M
+
+def fused_sdpa_backward(dO, 
+                        Q, K, V, 
+                        O, M, 
+                        causal=False,
+                        softmax_scale=None):
+    
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q, HEAD_DIM_Q = Q.shape
+ 
+        ### Default softmax scale if not provided ###    
+        if softmax_scale is None:
+            softmax_scale = 1 / HEAD_DIM_Q**0.5
+
+        ### Ensure our grads are contiguous ###
+        if not dO.is_contiguous():
+            dO = dO.contiguous()
+
+        ### Ensure grads have the same dtype
+        if not dO.dtype == Q.dtype:
+            dO = dO.to(Q.dtype)
+
+        ### Create Empty Grads to populate ###
+        dQ = torch.zeros_like(Q, dtype=Q.dtype)
+        dK = torch.zeros_like(K, dtype=K.dtype)
+        dV = torch.zeros_like(V, dtype=V.dtype)
+        D = torch.empty(BATCH_SIZE, NUM_HEADS, SEQ_LEN_Q, dtype=torch.float32, device=Q.device)
+    
+        preprocess_grid = lambda meta: (triton.cdiv(SEQ_LEN_Q, meta["BLOCK_SIZE"]), BATCH_SIZE * NUM_HEADS)
+
+        # Compute all the elements Di
+        attn_backward_preprocess[preprocess_grid](
+            O_ptr=O, 
+            dO_ptr=dO,
+            D_ptr=D,
+            stride_O_heads=O.stride(1), 
+            stride_O_len=O.stride(2), 
+            stride_O_embed=O.stride(3),
+            stride_dO_heads=dO.stride(1), 
+            stride_dO_len=dO.stride(2), 
+            stride_dO_embed=dO.stride(3),
+            stride_D_head=D.stride(1),
+            SEQ_LEN=SEQ_LEN_Q,
+            EMBED_DIM=HEAD_DIM_Q,
+        )
+
+        grid = lambda meta: (triton.cdiv(SEQ_LEN_Q, meta["BLOCK_SIZE_MACRO"]), BATCH_SIZE * NUM_HEADS)
+        _attn_bwd[grid](
+            Q_ptr=Q, 
+            K_ptr=K, 
+            V_ptr=V, 
+            dO_ptr=dO, 
+            dQ_ptr=dQ, 
+            dK_ptr=dK, 
+            dV_ptr=dV, 
+            M_ptr=M, 
+            D_ptr=D, 
+            softmax_scale=softmax_scale, 
+            stride_batch=Q.stride(0),
+            stride_head=Q.stride(1),
+            stride_len=Q.stride(2),
+            stride_embed=Q.stride(3), 
+            stride_k_batch=K.stride(0),
+            stride_k_head=K.stride(1),
+            stride_k_len=K.stride(2),
+            stride_k_embed=K.stride(3),
+            NUM_HEADS=NUM_HEADS, 
+            SEQ_LEN=SEQ_LEN_Q, 
+            HEAD_DIM=HEAD_DIM_Q, 
+            CAUSAL=1 if causal else 0, 
+            DTYPE_FLAG=0 if Q.dtype == torch.float32 else 1
+        )
+    
+        return dQ, dK, dV
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["SEQ_LEN"],
-        x_vals=[256 * i for i in range(1, 17)],
+        x_vals=[512 * i for i in range(1, 17)],
         line_arg="provider",
         line_vals=["torch", "triton", "naive"],
         line_names=["PyTorch SDPA", "Triton", "Naive"],
@@ -992,7 +1943,6 @@ def fused_sdpa_forward(Q, K, V,
 def bench_sdpa_forward(SEQ_LEN, mode, provider, causal, dtype, device="cuda"):
     
     BATCH, N_HEADS, HEAD_DIM = 4, 32, 64
-    sm_scale = 1.0 / HEAD_DIM**0.5
     is_fp16 = dtype=="float16"
     
     q = torch.randn(BATCH, N_HEADS, SEQ_LEN, HEAD_DIM, 
@@ -1016,35 +1966,88 @@ def bench_sdpa_forward(SEQ_LEN, mode, provider, causal, dtype, device="cuda"):
     return tflops
 
 if __name__ == "__main__":
+    
+    ############################################
+    ############ PSEUDOCODE CHECK ##############
+    ############################################
 
-    ### Check the Psuedocode (non-causal) ### 
-    Q = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16)
-    K = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16)
-    V = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16)
+    ### NON-CAUSAL ATTENTION PSEUDOCODE CHECK ###
+    Q = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    K = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    V = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    dO = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    output = torch.nn.functional.scaled_dot_product_attention(
+        Q, K, V, is_causal=False
+    )
+    output.backward(dO)
 
-    output_naive = naive_attention(Q, K, V)
-    output_flash = flash_attention_forward(Q, K, V)
-    assert torch.allclose(output_naive, output_flash, rtol=1e-2, atol=1e-2)
+    ### Pseudocode for Flash Attention ###
+    output_flash, M = flash_attention_forward_pseudocode(Q, K, V)
+    dQ, dK, dV = flash_attention_backward_pseudocode(Q, K, V, output_flash, dO, M)
+    assert torch.allclose(output, output_flash, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dQ, Q.grad, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dK, K.grad, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dV, V.grad, rtol=1e-2, atol=1e-2)
 
-    ### Check the Psuedocode (causal) ### 
-    output_naive = naive_attention(Q, K, V, is_causal=True)
-    output_flash = flash_attention_forward(Q, K, V, is_causal=True)
-    assert torch.allclose(output_naive, output_flash, rtol=1e-2, atol=1e-2)
+    ### CAUSAL ATTENTION PSEUDOCODE CHECK ###
+    Q = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    K = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    V = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    dO = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+
+    output = torch.nn.functional.scaled_dot_product_attention(
+        Q, K, V, is_causal=True
+    )
+    output.backward(dO)
+
+    ### Pseudocode for Flash Attention ###
+    output_flash, M = flash_attention_forward_pseudocode(Q, K, V, is_causal=True)
+    dQ, dK, dV = flash_attention_backward_pseudocode(Q, K, V, output_flash, dO, M, is_causal=True)
+    assert torch.allclose(output, output_flash, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dQ, Q.grad, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dK, K.grad, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dV, V.grad, rtol=1e-2, atol=1e-2)
+
+    ########################################
+    ############ KERNEL CHECK ##############
+    ########################################
     
     ### Check Flash Attention (non-causal) ###
-    output_naive = naive_attention(Q, K, V)
-    output_triton = fused_sdpa_forward(Q, K, V)
-    assert torch.allclose(output_naive, output_triton, rtol=1e-2, atol=1e-2)
+    Q = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    K = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    V = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    dO = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    output = torch.nn.functional.scaled_dot_product_attention(
+        Q, K, V
+    )
+    output.backward(dO)
+
+    output_triton, M = fused_sdpa_forward(Q, K, V)
+    dQ, dK, dV = fused_sdpa_backward(dO, Q, K, V, output_triton, M)
+    assert torch.allclose(output, output_triton, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dQ, Q.grad, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dK, K.grad, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dV, V.grad, rtol=1e-2, atol=1e-2)
 
     ### Check Flash Attention (causal) ###
-    output_naive = naive_attention(Q, K, V, is_causal=True)
-    output_triton = fused_sdpa_forward(Q, K, V, causal=True)
-    assert torch.allclose(output_naive, output_triton, rtol=1e-2, atol=1e-2)
+    Q = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    K = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    V = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    dO = torch.randn(2,4,32,64, device="cuda", dtype=torch.float16, requires_grad=True)
+    output = torch.nn.functional.scaled_dot_product_attention(
+        Q, K, V, is_causal=True
+    )
+    output.backward(dO)
 
+    output_triton, M = fused_sdpa_forward(Q, K, V, causal=True)
+    dQ, dK, dV = fused_sdpa_backward(dO, Q, K, V, output_triton, M, causal=True)
+    assert torch.allclose(output, output_triton, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dQ, Q.grad, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dK, K.grad, rtol=1e-2, atol=1e-2)
+    assert torch.allclose(dV, V.grad, rtol=1e-2, atol=1e-2)
+
+    ### Benchmark our Kernel ###
     bench_sdpa_forward.run(show_plots=True)
-
-    
-
 
                 
  
